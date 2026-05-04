@@ -358,7 +358,7 @@ void MDKPlayer::windowBeforeRendering() {
     // Don't render if sync() hasn't set up the render API for the current player yet
     if (m_syncNext) return;
 
-    if (m_renderedPosition == m_playerPosition && m_renderedReturnCount++ > 100) {
+    if (player->state() != mdk::PlaybackState::Playing && m_renderedPosition == m_playerPosition && m_renderedReturnCount++ > 100) {
         return;
     }
     if (m_readyForProcessing && !m_readyForProcessing(m_item)) return;
