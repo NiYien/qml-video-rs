@@ -162,6 +162,14 @@ void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
         }
     }
     qDebug2("setUrl") << "Final url:" << path;
+
+    // Tag R3D-SDK loads (.r3d/.nev) so that MDKPlayer::play() can run the
+    // deferred self-seek that re-aligns the master clock with the warmed-up
+    // decoder on every Paused→Playing transition (see comment in play()).
+    // Scope is intentionally narrow to the R3D SDK path; other formats
+    // including BRAW are unaffected.
+    m_isR3dFormat = customDecoder.startsWith("R3D:");
+
     m_player->setMedia(qUtf8Printable(path));
     m_player->prepare();
 }
@@ -538,6 +546,27 @@ void MDKPlayer::play() {
     if (!m_videoLoaded || !m_player) return;
     m_player->set(mdk::PlaybackState::Playing);
     forceRedraw();
+
+    if (m_isR3dFormat && m_item) {
+        // R3D SDK preview: Play immediately so the user gets visual feedback,
+        // then 500 ms later auto-issue seek(displayedPos) to mimic the manual
+        // user recovery sequence "Play → click timeline → fluid playback".
+        // The 500 ms Play interval warms up the cold R3D decoder, and the
+        // delayed seek flushes the packet queue + re-aligns the master clock
+        // with the warmed-up decoder. Without this, every Paused→Playing
+        // transition desyncs again because the decoder went cold during Pause.
+        // Scoped to R3D SDK only; other formats are unaffected.
+        QTimer::singleShot(500, m_item, [this] {
+            if (m_shuttingDown.load() || !m_player) return;
+            // Seek to the *displayed* frame timestamp, not m_player->position()
+            // — the latter returns the stalled master clock during buffering,
+            // which is older than the frame currently rendered, so seeking to
+            // it makes the picture jump backwards by one frame.
+            const int64_t pos = m_playerPosition;
+            qDebug2("MDKPlayer") << "R3D play: deferred self-seek to displayedPos=" << pos;
+            m_player->seek(pos, mdk::SeekFlag::FromStart);
+        });
+    }
 }
 void MDKPlayer::pause() {
     if (!m_videoLoaded || !m_player) return;
