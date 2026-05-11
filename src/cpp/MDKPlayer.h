@@ -125,6 +125,8 @@ private:
     float m_playbackRate{1.0};
     bool m_syncNext{false};
     bool m_isHttp{false};
+    bool m_isR3dFormat{false};
+    std::atomic<bool> m_playbackRequested{false};
     int64_t m_playerPosition{0};
 
     QJsonObject m_metadata;

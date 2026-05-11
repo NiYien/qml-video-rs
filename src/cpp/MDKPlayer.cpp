@@ -79,6 +79,7 @@ void MDKPlayer::initPlayer() {
 }
 void MDKPlayer::destroyPlayer() {
     m_shuttingDown = true; // Signal render thread to stop before any cleanup
+    m_playbackRequested.store(false, std::memory_order_release);
     m_videoLoaded = false;
     m_firstFrameLoaded = false;
     if (m_connectionBeforeRendering) QObject::disconnect(m_connectionBeforeRendering);
@@ -92,7 +93,14 @@ void MDKPlayer::destroyPlayer() {
         m_player->onEvent([](const mdk::MediaEvent &) -> bool { return false; });
         m_player->onFrame<mdk::VideoFrame>([](mdk::VideoFrame&, int) -> int { return 0; });
         auto ptr = m_player.release();
-        QTimer::singleShot(1000, [ptr] { delete ptr; }); // delete later
+        const bool deleteInBackground = m_isR3dFormat;
+        QTimer::singleShot(1000, [ptr, deleteInBackground] {
+            if (deleteInBackground) {
+                std::thread([ptr] { delete ptr; }).detach();
+            } else {
+                delete ptr;
+            }
+        }); // delete later
     }
 }
 
@@ -135,7 +143,9 @@ void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     if (url.toString().contains("http://") || url.toString().contains("https://")) {
         m_isHttp = true;
     }
+    const bool isR3dFormat = customDecoder.startsWith("R3D:");
     destroyPlayer();
+    m_isR3dFormat = isR3dFormat;
     initPlayer();
 
     QString additionalUrl;
@@ -207,7 +217,11 @@ void MDKPlayer::setReadyForProcessingCallback(ReadyForProcessingCb &&cb) {
 }
 
 void MDKPlayer::setupPlayer() {
-    m_player->setRenderCallback([this](void *) { QMetaObject::invokeMethod(m_item, "update"); });
+    auto player = m_player.get();
+    m_player->setRenderCallback([this, player](void *) {
+        if (m_player.get() != player) return;
+        QMetaObject::invokeMethod(m_item, "update");
+    });
     m_player->setProperty("continue_at_end", "1");
     if (!m_isHttp) {
         m_player->setBufferRange(0);
@@ -215,9 +229,10 @@ void MDKPlayer::setupPlayer() {
     for (auto it = m_defaultProperties.constBegin(); it != m_defaultProperties.constEnd(); ++it) {
         m_player->setProperty(toStdString(it.key()), toStdString(it.value()));
     }
-    m_player->onEvent([this](const mdk::MediaEvent &evt) -> bool {
+    m_player->onEvent([this, player](const mdk::MediaEvent &evt) -> bool {
+        if (m_player.get() != player) return false;
         if (evt.category == "metadata") {
-            auto md = m_player->mediaInfo();
+            auto md = player->mediaInfo();
             QJsonObject obj;
             for (const auto &x : getMediaInfo(md)) {
                 obj.insert(QString::fromUtf8(x.first.c_str(), x.first.size()), QString::fromUtf8(x.second.c_str(), x.second.size()));
@@ -236,7 +251,8 @@ void MDKPlayer::setupPlayer() {
     m_player->setBackgroundColor(m_bgColor.redF(), m_bgColor.greenF(), m_bgColor.blueF(), m_bgColor.alphaF());
     m_player->setPlaybackRate(m_playbackRate);
 
-    m_player->onStateChanged([this](mdk::State state) {
+    m_player->onStateChanged([this, player](mdk::State state) {
+        if (m_player.get() != player) return;
         // qDebug2("m_player->onStateChanged") <<
         //     QString(state == mdk::State::NotRunning?  "NotRunning"  : "") +
         //     QString(state == mdk::State::Running?     "Running"     : "") +
@@ -245,14 +261,14 @@ void MDKPlayer::setupPlayer() {
         QMetaObject::invokeMethod(m_item, "stateChanged", Q_ARG(int, int(state)));
     });
 
-    m_player->onMediaStatusChanged([this](mdk::MediaStatus status) -> bool {
-        if (!m_player) return false;
+    m_player->onMediaStatusChanged([this, player](mdk::MediaStatus status) -> bool {
+        if (m_player.get() != player) return false;
 
         if (status & mdk::MediaStatus::Buffering) {
             QMetaObject::invokeMethod(m_item, "setBuffering", Q_ARG(bool, true));
         } else if ((status & mdk::MediaStatus::Buffered) && !(status & mdk::MediaStatus::Seeking)) {
             QJsonArray ranges;
-            auto br = m_player->bufferedTimeRanges();
+            auto br = player->bufferedTimeRanges();
             for (const auto &r : br) {
                 QJsonObject obj;
                 obj.insert("start", QJsonValue(double(r.start)));
@@ -274,8 +290,11 @@ void MDKPlayer::setupPlayer() {
         //     QString(status & mdk::MediaStatus::Seeking?   "Seeking | "   : "") +
         //     QString(status & mdk::MediaStatus::Invalid?   "Invalid | "   : "");
 
-        if (!m_videoLoaded && (status & mdk::MediaStatus::Loaded) && (status & mdk::MediaStatus::Prepared)) {
-            auto md = m_player->mediaInfo();
+        bool expectedLoaded = false;
+        if ((status & mdk::MediaStatus::Loaded)
+            && (status & mdk::MediaStatus::Prepared)
+            && m_videoLoaded.compare_exchange_strong(expectedLoaded, true, std::memory_order_acq_rel)) {
+            auto md = player->mediaInfo();
 
             /*QJsonObject obj;
             for (const auto &x : getMediaInfo(md)) {
@@ -307,8 +326,7 @@ void MDKPlayer::setupPlayer() {
                 QMetaObject::invokeMethod(m_item, "update");
                 m_firstFrameLoaded = true;
             }
-            m_player->setLoop(9999999);
-            m_videoLoaded = true;
+            player->setLoop(9999999);
 
             if (!m_connectionBeforeRendering)
                 m_connectionBeforeRendering = QObject::connect(m_window, &QQuickWindow::beforeRendering, [this] { this->windowBeforeRendering(); });
@@ -358,7 +376,7 @@ void MDKPlayer::windowBeforeRendering() {
     // Don't render if sync() hasn't set up the render API for the current player yet
     if (m_syncNext) return;
 
-    if (player->state() != mdk::PlaybackState::Playing && m_renderedPosition == m_playerPosition && m_renderedReturnCount++ > 100) {
+    if (!m_playbackRequested.load(std::memory_order_acquire) && m_renderedPosition == m_playerPosition && m_renderedReturnCount++ > 100) {
         return;
     }
     if (m_readyForProcessing && !m_readyForProcessing(m_item)) return;
@@ -536,16 +554,23 @@ void MDKPlayer::sync(QSGImageNode *node, QSize newSize, QQuickItem *item, bool f
 
 void MDKPlayer::play() {
     if (!m_videoLoaded || !m_player) return;
+    const int64_t pos = m_playerPosition;
+    m_playbackRequested.store(true, std::memory_order_release);
     m_player->set(mdk::PlaybackState::Playing);
     forceRedraw();
+    if (m_isR3dFormat) {
+        m_player->seek(pos, mdk::SeekFlag::FromStart);
+    }
 }
 void MDKPlayer::pause() {
     if (!m_videoLoaded || !m_player) return;
+    m_playbackRequested.store(false, std::memory_order_release);
     m_player->set(mdk::PlaybackState::Paused);
     forceRedraw();
 }
 void MDKPlayer::stop() {
     if (!m_videoLoaded || !m_player) return;
+    m_playbackRequested.store(false, std::memory_order_release);
     m_player->set(mdk::PlaybackState::Stopped);
     m_player->waitFor(mdk::PlaybackState::Stopped);
 }
