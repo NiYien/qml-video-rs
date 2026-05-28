@@ -53,11 +53,25 @@ fn main() {
     let arch_win = if target_arch == "aarch64" { "arm64" } else { "x64" };
     let arch_lnx = if target_arch == "aarch64" { "arm64" } else { "amd64" };
 
+    // NiYien pin: Windows / macOS / Android download from nightly.link, which
+    // proxies wang-bin/mdk-sdk GitHub Actions run 26333965038 (MDK commit
+    // 503d1ed, the only known-good MDK with Nikon ZR .R3D native frame size).
+    // SourceForge nightly is a rolling pointer that drifted onto a regressed
+    // MDK; per-run nightly.link URLs are immutable.
+    //
+    // Restore path: when wang-bin stabilises Nikon ZR support, replace these
+    // three URLs back to the SF nightly form (or a stable release-tag URL)
+    // and bump the qml-video-rs rev in gyroflow's Cargo.toml. The `.zip`
+    // outer-wrapper handling in download_and_extract is a no-op for
+    // `.7z` / `.tar.xz` URLs, so it can stay in place.
+    //
+    // Linux and iOS are not in the active gyroflow build matrix and remain
+    // on the SF nightly URL.
     let sdk: HashMap<&str, (String, String, &str, &str)> = vec![
-        ("windows",  (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-windows-clang.7z?viasf=1", nightly),          format!("lib/{arch_win}/"),    "mdk.lib",    "include/")),
+        ("windows",  ("https://nightly.link/wang-bin/mdk-sdk/actions/runs/26333965038/mdk-sdk-clang-windows-MinSizeRel.zip".to_string(),  format!("lib/{arch_win}/"),    "mdk.lib",    "include/")),
         ("linux",    (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-linux.tar.xz?viasf=1", nightly),              format!("lib/{arch_lnx}/"),    "libmdk.so",  "include/")),
-        ("macos",    (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-macOS.tar.xz?viasf=1", nightly),              format!("lib/mdk.framework/"), "mdk",        "include/")),
-        ("android",  (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-android.7z?viasf=1", nightly),                format!("lib/arm64-v8a/"),     "libmdk.so",  "include/")),
+        ("macos",    ("https://nightly.link/wang-bin/mdk-sdk/actions/runs/26333965038/mdk-sdk-macOS.zip".to_string(),                    format!("lib/mdk.framework/"), "mdk",        "include/")),
+        ("android",  ("https://nightly.link/wang-bin/mdk-sdk/actions/runs/26333965038/mdk-sdk-android-arm64-v8a-MinSizeRel.zip".to_string(), format!("lib/arm64-v8a/"),  "libmdk.so",  "include/")),
         ("ios",      (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-iOS.tar.xz?viasf=1", nightly),                format!("lib/mdk.framework/"), "mdk",        "include/")),
     ].into_iter().collect();
 
@@ -134,12 +148,35 @@ fn download_and_extract(url: &str, check: &str) -> Result<String, std::io::Error
     let out_dir = env::var("OUT_DIR").unwrap();
 
     if !Path::new(&format!("{}/mdk-sdk/{}", out_dir, check)).exists() && !Path::new(&format!("{}/mdk-sdk/{}", out_dir, check.replace("mdk.framework", "mdk.xcframework"))).exists() {
-        let ext = if url.contains(".tar.xz") { ".tar.xz" } else { ".7z" };
+        // Detect outer archive extension. `.zip` is the nightly.link wrapper
+        // (zip-of-7z or zip-of-tar.xz); `.tar.xz` and `.7z` are the original
+        // wang-bin formats served directly by SourceForge.
+        let download_ext = if url.ends_with(".zip") { ".zip" }
+                          else if url.contains(".tar.xz") { ".tar.xz" }
+                          else { ".7z" };
         {
             let mut reader = ureq::get(url).call().map(|x| x.into_body().into_reader()).map_err(|_| std::io::ErrorKind::Other)?;
-            let mut file = File::create(format!("{}/mdk-sdk{}", out_dir, ext))?;
+            let mut file = File::create(format!("{}/mdk-sdk{}", out_dir, download_ext))?;
             std::io::copy(&mut reader, &mut file)?;
         }
+        // If the outer is a nightly.link zip, peel it to expose the inner
+        // wang-bin archive, then continue through the existing .7z / .tar.xz
+        // extraction logic. The inner archive's filename follows wang-bin's
+        // `mdk-sdk-*` convention.
+        let ext = if download_ext == ".zip" {
+            Command::new("7z").current_dir(&out_dir).args(&["x", "-y", "mdk-sdk.zip"]).status()?;
+            std::fs::remove_file(format!("{}/mdk-sdk.zip", out_dir))?;
+            let inner = std::fs::read_dir(&out_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.starts_with("mdk-sdk-") && (n.ends_with(".7z") || n.ends_with(".tar.xz")))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Inner archive (mdk-sdk-*.7z or mdk-sdk-*.tar.xz) not found after unzipping outer nightly.link wrapper"))?;
+            let inner_ext = if inner.ends_with(".tar.xz") { ".tar.xz" } else { ".7z" };
+            std::fs::rename(format!("{}/{}", out_dir, inner), format!("{}/mdk-sdk{}", out_dir, inner_ext))?;
+            inner_ext
+        } else {
+            download_ext
+        };
         Command::new("7z").current_dir(&out_dir).args(&["x", "-y", &format!("mdk-sdk{}", ext)]).status()?;
         std::fs::remove_file(format!("{}/mdk-sdk{}", out_dir, ext))?;
         if ext == ".tar.xz" {
