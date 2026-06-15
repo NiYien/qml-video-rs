@@ -66,7 +66,19 @@ void MDKPlayer::initPlayer() {
         "VAAPI:sw_fallback=1",
     #endif
         "BRAW:gpu=auto:copy=1:scale=1920x1080",
+    #if (__APPLE__+0)
+        // REDMetal (RED SDK's Apple-Silicon GPU decode) corrupts the red channel
+        // when RED decodes R3D at a reduced resolution whose width is not
+        // 16-aligned: scale=1920x1080 maps a 6048-wide sensor to RED's quarter-res
+        // fraction 1512 (1512/16=94.5), producing cyan horizontal stripes. Request
+        // a larger scale so RED lands on its 16-aligned half-res fraction (3024),
+        // which decodes clean. The decode itself is the bug (not the renderer), so
+        // this is macOS-only; Windows/Linux use CUDA/OpenCL backends that are
+        // unaffected.
+        "R3D:gpu=auto:scale=3840x2160",
+    #else
         "R3D:gpu=auto:scale=1920x1080",
+    #endif
         "FFmpeg"});
     }
 
