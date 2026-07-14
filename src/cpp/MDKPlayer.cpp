@@ -52,7 +52,14 @@ void MDKPlayer::initPlayer() {
     #if (__APPLE__+0)
         "VT:duration=0",
     #elif (__ANDROID__+0)
-        "AMediaCodec:java=0:copy=0:surface=1:async=0:image=0",
+        // image=1 delivers decoded frames through AImageReader (AHardwareBuffer)
+        // instead of the SurfaceTexture handoff. The SurfaceTexture path lacks
+        // fence synchronization between the hardware decoder writing a buffer
+        // and GL sampling it (observed on Xiaomi/HyperOS): the decoder fills
+        // macroblock rows top-to-bottom, so the bottom of the frame is the last
+        // to complete and shows as high-frequency tearing/wobble during
+        // playback. AImageReader keeps zero-copy and hardware decode.
+        "AMediaCodec:java=0:copy=0:surface=1:async=0:image=1",
     #elif (_WIN32+0)
         // "MFT:d3d=11",
         //"CUDA",
