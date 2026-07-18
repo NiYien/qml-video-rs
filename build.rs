@@ -53,11 +53,14 @@ fn main() {
     let arch_win = if target_arch == "aarch64" { "arm64" } else { "x64" };
     let arch_lnx = if target_arch == "aarch64" { "arm64" } else { "amd64" };
 
-    // NiYien pin: Windows / macOS / Android download from nightly.link, which
-    // proxies wang-bin/mdk-sdk GitHub Actions run 26333965038 (MDK commit
-    // 503d1ed, the only known-good MDK with Nikon ZR .R3D native frame size).
-    // SourceForge nightly is a rolling pointer that drifted onto a regressed
-    // MDK; per-run nightly.link URLs are immutable.
+    // NiYien pin: Windows / macOS / Android download from this repo's own
+    // `mdk-503d1ed` release, which mirrors wang-bin/mdk-sdk GitHub Actions
+    // run 26333965038 (MDK commit 503d1ed, the only known-good MDK with
+    // Nikon ZR .R3D native frame size). Assets are the raw Actions artifact
+    // zips, byte-identical to what nightly.link used to serve; the mirror
+    // exists because nightly.link is a third-party proxy that degraded on
+    // 2026-07-18 and the source artifacts expire on 2026-08-21 anyway.
+    // Re-mirror via .github/workflows/mirror-mdk.yml when bumping the pin.
     //
     // Restore path: when wang-bin stabilises Nikon ZR support, replace these
     // three URLs back to the SF nightly form (or a stable release-tag URL)
@@ -68,10 +71,10 @@ fn main() {
     // Linux and iOS are not in the active gyroflow build matrix and remain
     // on the SF nightly URL.
     let sdk: HashMap<&str, (String, String, &str, &str)> = vec![
-        ("windows",  ("https://nightly.link/wang-bin/mdk-sdk/actions/runs/26333965038/mdk-sdk-clang-windows-MinSizeRel.zip".to_string(),  format!("lib/{arch_win}/"),    "mdk.lib",    "include/")),
+        ("windows",  ("https://github.com/NiYien/qml-video-rs/releases/download/mdk-503d1ed/mdk-sdk-clang-windows-MinSizeRel.zip".to_string(),  format!("lib/{arch_win}/"),    "mdk.lib",    "include/")),
         ("linux",    (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-linux.tar.xz?viasf=1", nightly),              format!("lib/{arch_lnx}/"),    "libmdk.so",  "include/")),
-        ("macos",    ("https://nightly.link/wang-bin/mdk-sdk/actions/runs/26333965038/mdk-sdk-macOS.zip".to_string(),                    format!("lib/mdk.framework/"), "mdk",        "include/")),
-        ("android",  ("https://nightly.link/wang-bin/mdk-sdk/actions/runs/26333965038/mdk-sdk-android-arm64-v8a-MinSizeRel.zip".to_string(), format!("lib/arm64-v8a/"),  "libmdk.so",  "include/")),
+        ("macos",    ("https://github.com/NiYien/qml-video-rs/releases/download/mdk-503d1ed/mdk-sdk-macOS.zip".to_string(),                    format!("lib/mdk.framework/"), "mdk",        "include/")),
+        ("android",  ("https://github.com/NiYien/qml-video-rs/releases/download/mdk-503d1ed/mdk-sdk-android-arm64-v8a-MinSizeRel.zip".to_string(), format!("lib/arm64-v8a/"),  "libmdk.so",  "include/")),
         ("ios",      (format!("https://master.dl.sourceforge.net/project/mdk-sdk/{}mdk-sdk-iOS.tar.xz?viasf=1", nightly),                format!("lib/mdk.framework/"), "mdk",        "include/")),
     ].into_iter().collect();
 
