@@ -1,0 +1,53 @@
+# Mirror pinned MDK SDK artifacts from wang-bin/mdk-sdk GitHub Actions runs
+# into a release on this repository, so build.rs can download them from a
+# stable GitHub-CDN URL instead of nightly.link (third-party proxy, degraded
+# 2026-07-18) or expiring Actions artifacts (90-day retention).
+#
+# Re-run this workflow with a new run_id/tag when bumping the MDK pin.
+name: Mirror MDK SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'wang-bin/mdk-sdk workflow run id to mirror'
+        required: true
+        default: '26333965038'
+      tag:
+        description: 'Release tag to create/update on this repo'
+        required: true
+        default: 'mdk-503d1ed'
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts and upload as release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euxo pipefail
+          artifacts="mdk-sdk-macOS mdk-sdk-clang-windows-MinSizeRel mdk-sdk-android-arm64-v8a-MinSizeRel"
+          for name in $artifacts; do
+            id=$(gh api "repos/wang-bin/mdk-sdk/actions/runs/$RUN_ID/artifacts?per_page=100" \
+                 --jq ".artifacts[] | select(.name==\"$name\") | .id")
+            echo "artifact $name id=$id"
+            # Primary: authenticated GitHub API. Fallback: nightly.link proxy with retries.
+            gh api "repos/wang-bin/mdk-sdk/actions/artifacts/$id/zip" > "$name.zip" \
+              || curl -fL --retry 10 --retry-delay 15 --retry-all-errors \
+                   -o "$name.zip" \
+                   "https://nightly.link/wang-bin/mdk-sdk/actions/runs/$RUN_ID/$name.zip"
+            ls -la "$name.zip"
+            # Integrity check: must be a valid zip containing an inner mdk-sdk-* archive
+            unzip -l "$name.zip" | grep -E "mdk-sdk-.*\.(7z|tar\.xz)"
+          done
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "MDK SDK mirror ($TAG)" \
+                 --notes "Mirror of wang-bin/mdk-sdk GitHub Actions run $RUN_ID artifacts (MDK commit pinned by build.rs). Each asset is the raw Actions artifact zip (outer zip wrapping the original mdk-sdk-*.7z / .tar.xz), byte-identical to what nightly.link served. Consumed by build.rs of this repo."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber mdk-sdk-*.zip
