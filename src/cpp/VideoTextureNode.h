@@ -55,6 +55,16 @@ public:
     std::unique_ptr<QRhiTextureRenderTarget> m_rt;
     std::unique_ptr<QRhiRenderPassDescriptor> m_rtRp;
 
+#if (__ANDROID__+0)
+    // On Android m_rt preserves its color contents (see createTexture), so no
+    // render pass ever clears the texture implicitly. This second render target
+    // points at the same texture but clears on beginPass; it is used exactly
+    // once after the texture is (re)created to initialise the allocation.
+    std::unique_ptr<QRhiTextureRenderTarget> m_rtClear;
+    std::unique_ptr<QRhiRenderPassDescriptor> m_rtClearRp;
+    bool m_needsInitialClear{false};
+#endif
+
     QSGImageNode::TextureCoordinatesTransformMode m_tx{QSGImageNode::TextureCoordinatesTransformFlag::NoTransform};
     QPointer<QQuickItem>   m_item;
     QPointer<QQuickWindow> m_window;

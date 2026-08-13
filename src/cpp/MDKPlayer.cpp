@@ -411,7 +411,18 @@ void MDKPlayer::windowBeforeRendering() {
 
     if (doRenderPass) {
         QRhiResourceUpdateBatch *u = context->rhi()->nextResourceUpdateBatch();
-        cb->beginPass(m_rt.get(), QColor(Qt::black), { 1.0f, 0 }, u, QRhiCommandBuffer::ExternalContent);
+        QRhiTextureRenderTarget *rt = m_rt.get();
+#if (__ANDROID__+0)
+        // m_rt preserves its color contents on Android, so the very first pass
+        // after the texture was (re)created goes through the clearing target to
+        // initialise the allocation. Both target the same texture, so which one
+        // opens the pass only decides whether the contents survive.
+        if (m_needsInitialClear && m_rtClear) {
+            rt = m_rtClear.get();
+            m_needsInitialClear = false;
+        }
+#endif
+        cb->beginPass(rt, QColor(Qt::black), { 1.0f, 0 }, u, QRhiCommandBuffer::ExternalContent);
     }
 
     cb->beginExternal();
