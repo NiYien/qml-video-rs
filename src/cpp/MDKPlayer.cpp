@@ -316,22 +316,29 @@ void MDKPlayer::setupPlayer() {
         }
 
         if (!m_toneCurveProbed.exchange(true)) {
-            // One-shot diagnostic: tells us what the decoder actually handed
-            // over, and whether the widening really preserved 16 bits (a max
-            // that is an exact multiple of 257 means it went through 8-bit).
+            // One-shot diagnostic: what the decoder handed over, and whether the
+            // widening really preserved 16 bits. Alpha is skipped - it is a
+            // constant 65535 and would swamp the range. A frame that was only
+            // ever 8-bit has every sample either v*257 or v<<8, so a single
+            // sample that is neither proves the data is genuinely 16-bit.
             uint16_t mn = 0xFFFF, mx = 0;
+            bool not257 = false, not256 = false;
             for (int y = 0; y < h; ++y) {
                 const auto *s = reinterpret_cast<const uint16_t *>(src + size_t(y) * size_t(srcStride));
-                // Explicit comparisons: <windows.h> defines min/max as macros,
-                // which breaks std::min/std::max on MSVC.
-                for (int x = 0; x < w * 4; ++x) {
-                    if (s[x] < mn) mn = s[x];
-                    if (s[x] > mx) mx = s[x];
+                for (int x = 0; x < w; ++x, s += 4) {
+                    for (int c = 0; c < 3; ++c) {
+                        // Explicit comparisons: <windows.h> defines min/max as
+                        // macros, which breaks std::min/std::max on MSVC.
+                        if (s[c] < mn) mn = s[c];
+                        if (s[c] > mx) mx = s[c];
+                        if (s[c] % 257 != 0) not257 = true;
+                        if (s[c] % 256 != 0) not256 = true;
+                    }
                 }
             }
             qDebug2("toneCurve") << "in fmt" << int(frame.format()) << "planes" << frame.planeCount()
-                                 << "-> RGBA64" << w << "x" << h << "sample range" << mn << ".." << mx
-                                 << (mx % 257 == 0 ? "(WARNING: looks 8-bit)" : "(16-bit)");
+                                 << "-> RGBA64" << w << "x" << h << "RGB range" << mn << ".." << mx
+                                 << ((not257 && not256) ? "(true 16-bit)" : "(WARNING: 8-bit derived)");
         }
 
         std::vector<uint8_t> dst(size_t(dstStride) * size_t(h));
@@ -347,10 +354,15 @@ void MDKPlayer::setupPlayer() {
             }
         }
 
-        mdk::VideoFrame out(w, h, mdk::PixelFormat::RGBA64);
-        // Null buf/bufDeleter means MDK copies, so `dst` may die with this scope.
-        if (!out.addBuffer(dst.data(), dstStride, 0)) {
-            qDebug2("toneCurve") << "addBuffer failed; frame left untouched";
+        // Allocate and copy in one step: this constructor path allocates a
+        // contiguous buffer and copies `planes` into it, so `dst` may die with
+        // this scope. (addBuffer() on a freshly constructed frame is rejected -
+        // it expects the plane to already exist.)
+        int strides[1] = { dstStride };
+        const uint8_t *planes[1] = { dst.data() };
+        mdk::VideoFrame out(w, h, mdk::PixelFormat::RGBA64, strides, planes);
+        if (!out || !out.bufferData(0)) {
+            qDebug2("toneCurve") << "could not build the curved frame; leaving it untouched";
             return 0;
         }
         out.setTimestamp(frame.timestamp());
