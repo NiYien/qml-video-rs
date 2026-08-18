@@ -59,6 +59,16 @@ impl MDKPlayerWrapper {
         })
     }
 
+    /// Installs a 65536-entry tone curve applied to decoded frames before they
+    /// reach the renderer. Any other length clears it. See `MDKPlayer::setToneCurve`.
+    pub fn set_tone_curve(&mut self, curve: &[u16]) {
+        let ptr = curve.as_ptr();
+        let len = curve.len();
+        cpp!(unsafe [self as "MDKPlayerWrapper *", ptr as "const uint16_t *", len as "size_t"] {
+            self->mdkplayer->setToneCurve(ptr, len);
+        })
+    }
+
     pub fn set_background_color(&mut self, color: QColor) {
         cpp!(unsafe [self as "MDKPlayerWrapper *", color as "QColor"] {
             self->mdkplayer->setBackgroundColor(color);

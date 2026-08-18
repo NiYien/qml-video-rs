@@ -152,6 +152,19 @@ void MDKPlayer::setDefaultProperty(const QString &key, const QString &value) {
     m_defaultProperties.insert(key, value);
 }
 
+void MDKPlayer::setToneCurve(const uint16_t *data, size_t len) {
+    std::lock_guard<std::mutex> lock(m_toneCurveMutex);
+    if (!data || len != TONE_CURVE_LEN) {
+        if (m_toneCurve) qDebug2("setToneCurve") << "cleared";
+        m_toneCurve.reset();
+        m_toneCurveProbed = false;
+        return;
+    }
+    m_toneCurve = std::make_shared<const std::vector<uint16_t>>(data, data + len);
+    m_toneCurveProbed = false;
+    qDebug2("setToneCurve") << "installed" << len << "entries";
+}
+
 void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     m_overrideFps = 0.0;
     if (!m_item || !m_window || !m_node) {
@@ -265,6 +278,84 @@ void MDKPlayer::setupPlayer() {
         }
         qDebug2("m_player->onEvent") << QString::fromUtf8(evt.category.c_str(), evt.category.size()) << QString::fromUtf8(evt.detail.c_str(), evt.detail.size());
         return true;
+    });
+
+    // Tone-curve filter. MDK invokes this before handing the frame to the
+    // renderer, which is the last point where the samples are still wider than
+    // the RGBA8 render target. With no curve installed - i.e. every load that
+    // is not a CinemaDNG carrying a LinearizationTable - it returns immediately
+    // and the frame is delivered byte for byte as before.
+    m_player->onFrame<mdk::VideoFrame>([this, player](mdk::VideoFrame &frame, int) -> int {
+        if (m_player.get() != player) return 0;
+
+        std::shared_ptr<const std::vector<uint16_t>> curve;
+        {
+            std::lock_guard<std::mutex> lock(m_toneCurveMutex);
+            curve = m_toneCurve;
+        }
+        if (!curve) return 0;
+        if (!frame || frame.timestamp() == mdk::TimestampEOS) return 0;
+
+        // The decoded frame is a CFA layout MDK has no PixelFormat name for, so
+        // to() is the only supported way to reach its samples. RGBA64 keeps all
+        // 16 bits through the demosaic, which is the whole point of doing this
+        // here rather than after the renderer.
+        auto wide = frame.to(mdk::PixelFormat::RGBA64);
+        if (!wide) {
+            qDebug2("toneCurve") << "to(RGBA64) failed; frame left untouched";
+            return 0;
+        }
+        const int w = wide.width();
+        const int h = wide.height();
+        const int srcStride = wide.bytesPerLine(0);
+        const uint8_t *src = wide.bufferData(0);
+        const int dstStride = w * 8; // RGBA64 = 4 channels * 2 bytes
+        if (w <= 0 || h <= 0 || !src || srcStride < dstStride) {
+            qDebug2("toneCurve") << "unexpected RGBA64 geometry" << w << h << srcStride;
+            return 0;
+        }
+
+        if (!m_toneCurveProbed.exchange(true)) {
+            // One-shot diagnostic: tells us what the decoder actually handed
+            // over, and whether the widening really preserved 16 bits (a max
+            // that is an exact multiple of 257 means it went through 8-bit).
+            uint16_t mn = 0xFFFF, mx = 0;
+            for (int y = 0; y < h; ++y) {
+                const auto *s = reinterpret_cast<const uint16_t *>(src + size_t(y) * size_t(srcStride));
+                // Explicit comparisons: <windows.h> defines min/max as macros,
+                // which breaks std::min/std::max on MSVC.
+                for (int x = 0; x < w * 4; ++x) {
+                    if (s[x] < mn) mn = s[x];
+                    if (s[x] > mx) mx = s[x];
+                }
+            }
+            qDebug2("toneCurve") << "in fmt" << int(frame.format()) << "planes" << frame.planeCount()
+                                 << "-> RGBA64" << w << "x" << h << "sample range" << mn << ".." << mx
+                                 << (mx % 257 == 0 ? "(WARNING: looks 8-bit)" : "(16-bit)");
+        }
+
+        std::vector<uint8_t> dst(size_t(dstStride) * size_t(h));
+        const uint16_t *lut = curve->data();
+        for (int y = 0; y < h; ++y) {
+            const auto *s = reinterpret_cast<const uint16_t *>(src + size_t(y) * size_t(srcStride));
+            auto *d = reinterpret_cast<uint16_t *>(dst.data() + size_t(y) * size_t(dstStride));
+            for (int x = 0; x < w; ++x, s += 4, d += 4) {
+                d[0] = lut[s[0]];
+                d[1] = lut[s[1]];
+                d[2] = lut[s[2]];
+                d[3] = s[3]; // alpha carries no scene light
+            }
+        }
+
+        mdk::VideoFrame out(w, h, mdk::PixelFormat::RGBA64);
+        // Null buf/bufDeleter means MDK copies, so `dst` may die with this scope.
+        if (!out.addBuffer(dst.data(), dstStride, 0)) {
+            qDebug2("toneCurve") << "addBuffer failed; frame left untouched";
+            return 0;
+        }
+        out.setTimestamp(frame.timestamp());
+        frame = std::move(out);
+        return 0; // one frame in, one frame out
     });
 
     m_player->setBackgroundColor(m_bgColor.redF(), m_bgColor.greenF(), m_bgColor.blueF(), m_bgColor.alphaF());

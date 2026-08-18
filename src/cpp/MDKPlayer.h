@@ -11,6 +11,9 @@
 #include <queue>
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "VideoTextureNode.h"
 
@@ -32,6 +35,20 @@ public:
     void setUrl(const QUrl &url, const QString &customDecoder);
     void setProperty(const QString &key, const QString &value);
     void setDefaultProperty(const QString &key, const QString &value);
+
+    // Tone curve applied to decoded frames before they reach the renderer.
+    //
+    // CinemaDNG decodes to scene-linear samples: ffmpeg honours the file's
+    // LinearizationTable, which undoes the perceptually uniform log encoding the
+    // camera applied. Rendering that straight into the RGBA8 texture leaves ~10
+    // distinct levels with most pixels at zero. The curve maps the samples back
+    // onto a uniform range while they are still 16-bit, so the 8-bit render
+    // target stops being the bottleneck and does not need to change.
+    //
+    // `len` must be TONE_CURVE_LEN. Any other length - including 0 - clears the
+    // curve, which is how every non-DNG load keeps its existing behaviour.
+    static constexpr size_t TONE_CURVE_LEN = 65536;
+    void setToneCurve(const uint16_t *data, size_t len);
 
     void setBackgroundColor(const QColor &color);
 
@@ -137,6 +154,12 @@ private:
     QString m_pendingCustomDecoder;
     QHash<QString, QString> m_defaultProperties;
     std::atomic<bool> m_shuttingDown{false};
+
+    // Guarded because the onFrame filter runs on a decoder thread while
+    // setToneCurve() is called from the GUI thread on load.
+    std::mutex m_toneCurveMutex;
+    std::shared_ptr<const std::vector<uint16_t>> m_toneCurve;
+    std::atomic<bool> m_toneCurveProbed{false};
 };
 
 // Simple wrapper class to workaround class alignment issues when using it from Rust
