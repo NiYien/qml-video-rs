@@ -65,7 +65,8 @@ void MDKPlayer::initPlayer() {
         //"CUDA",
         //"NVDEC",
         //"CUVID",
-        "D3D11:sw_fallback=1",
+        // Limit hardware frame buffers; let FFmpeg retain automatic threading for software fallback.
+        "D3D11:threads=1:sw_fallback=0",
         "DXVA",
     #elif (__linux__+0)
         "CUDA",
@@ -613,7 +614,9 @@ void MDKPlayer::windowBeforeRendering() {
                     m_fence->SetEventOnCompletion(m_fenceValue, m_event);
                     WaitForSingleObject(m_event, 5000);
                 }
+                ctx4->Release();
             }
+            dev5->Release();
         }
     }
 #endif
