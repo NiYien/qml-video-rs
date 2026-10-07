@@ -165,6 +165,14 @@ impl MDKVideoItem {
         self.m_player.set_default_property(key, value);
     }
 
+    /// Installs a tone curve applied to decoded frames before they reach the
+    /// renderer, or clears it when `curve` is not 65536 entries long. Not
+    /// exposed to QML: the table is far too large to move through a QVariant,
+    /// and the only caller builds it in Rust from the source file's metadata.
+    pub fn setToneCurve(&mut self, curve: &[u16]) {
+        self.m_player.set_tone_curve(curve);
+    }
+
     pub fn setMuted(&mut self, v: bool) { self.m_player.set_muted(v); self.mutedChanged(); }
     pub fn getMuted(&self) -> bool { self.m_player.get_muted() }
 

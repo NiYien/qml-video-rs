@@ -30,7 +30,27 @@ QSGTexture *VideoTextureNodePriv::createTexture(mdk::Player *player, const QSize
     m_proj = rhi->clipSpaceCorrMatrix();
 
     QRhiColorAttachment color0(m_texture);
+
+#if (__ANDROID__+0)
+    // Preserve the color attachment across render passes. MDKPlayer opens a pass
+    // on every scene repaint, but renderVideo() can legitimately draw nothing: a
+    // seek flushes AMediaCodec and the AImageReader path (image=1) reclaims the
+    // in-flight AImage, leaving MDK without a frame to redraw for ~90ms. Any
+    // repaint landing in that gap would otherwise commit the black clear value
+    // and show up as a black preview frame. Repaints are frequent exactly then,
+    // because dragging the timeline animates QML and forces a full scene repaint
+    // every vsync -- hence the continuous flicker while dragging.
+    // Desktop keeps the clearing target: its decoders retain a last frame and the
+    // gap is far shorter, so there is nothing to fix there and no reason to pay
+    // the tile-load cost this flag implies on tile-based GPUs.
+    m_rtClear.reset();
+    m_rtClearRp.reset();
+    m_needsInitialClear = false;
+
+    m_rt.reset(rhi->newTextureRenderTarget({color0}, QRhiTextureRenderTarget::PreserveColorContents));
+#else
     m_rt.reset(rhi->newTextureRenderTarget({color0}));
+#endif
     if (!m_rt) {
         return nullptr;
     }
@@ -44,6 +64,30 @@ QSGTexture *VideoTextureNodePriv::createTexture(mdk::Player *player, const QSize
     if (!m_rt->create()) {
         return nullptr;
     }
+
+#if (__ANDROID__+0)
+    // Second target on the same texture, this one clearing. Now that the primary
+    // target preserves its contents, nothing else would ever initialise the
+    // allocation, so the first pass after (re)creation goes through here --
+    // otherwise the first frames show whatever the driver left behind, or the
+    // previous clip when the texture is recreated on a source switch.
+    m_rtClear.reset(rhi->newTextureRenderTarget({color0}));
+    if (m_rtClear) {
+        m_rtClearRp.reset(m_rtClear->newCompatibleRenderPassDescriptor());
+        if (m_rtClearRp) {
+            m_rtClear->setRenderPassDescriptor(m_rtClearRp.get());
+            m_needsInitialClear = m_rtClear->create();
+        }
+    }
+    if (!m_needsInitialClear) {
+        // Could not build the clearing target: drop it and let the first frame
+        // render into the preserving one. Uninitialised contents are a cosmetic
+        // risk, not a correctness one, and this path is not expected to happen.
+        m_rtClear.reset();
+        m_rtClearRp.reset();
+        qDebug2("VideoTextureNodePriv::createTexture") << "failed to create the initial-clear render target";
+    }
+#endif
 
     QSGRendererInterface *rif = m_window->rendererInterface();
     switch (rif->graphicsApi()) {

@@ -52,13 +52,21 @@ void MDKPlayer::initPlayer() {
     #if (__APPLE__+0)
         "VT:duration=0",
     #elif (__ANDROID__+0)
-        "AMediaCodec:java=0:copy=0:surface=1:async=0:image=0",
+        // image=1 delivers decoded frames through AImageReader (AHardwareBuffer)
+        // instead of the SurfaceTexture handoff. The SurfaceTexture path lacks
+        // fence synchronization between the hardware decoder writing a buffer
+        // and GL sampling it (observed on Xiaomi/HyperOS): the decoder fills
+        // macroblock rows top-to-bottom, so the bottom of the frame is the last
+        // to complete and shows as high-frequency tearing/wobble during
+        // playback. AImageReader keeps zero-copy and hardware decode.
+        "AMediaCodec:java=0:copy=0:surface=1:async=0:image=1",
     #elif (_WIN32+0)
         // "MFT:d3d=11",
         //"CUDA",
         //"NVDEC",
         //"CUVID",
-        "D3D11:sw_fallback=1",
+        // Limit hardware frame buffers; let FFmpeg retain automatic threading for software fallback.
+        "D3D11:threads=1:sw_fallback=0",
         "DXVA",
     #elif (__linux__+0)
         "CUDA",
@@ -91,6 +99,7 @@ void MDKPlayer::initPlayer() {
 }
 void MDKPlayer::destroyPlayer() {
     m_shuttingDown = true; // Signal render thread to stop before any cleanup
+    m_playbackRequested.store(false, std::memory_order_release);
     m_videoLoaded = false;
     m_firstFrameLoaded = false;
     if (m_connectionBeforeRendering) QObject::disconnect(m_connectionBeforeRendering);
@@ -104,7 +113,14 @@ void MDKPlayer::destroyPlayer() {
         m_player->onEvent([](const mdk::MediaEvent &) -> bool { return false; });
         m_player->onFrame<mdk::VideoFrame>([](mdk::VideoFrame&, int) -> int { return 0; });
         auto ptr = m_player.release();
-        QTimer::singleShot(1000, [ptr] { delete ptr; }); // delete later
+        const bool deleteInBackground = m_isR3dFormat;
+        QTimer::singleShot(1000, [ptr, deleteInBackground] {
+            if (deleteInBackground) {
+                std::thread([ptr] { delete ptr; }).detach();
+            } else {
+                delete ptr;
+            }
+        }); // delete later
     }
 }
 
@@ -137,6 +153,19 @@ void MDKPlayer::setDefaultProperty(const QString &key, const QString &value) {
     m_defaultProperties.insert(key, value);
 }
 
+void MDKPlayer::setToneCurve(const uint16_t *data, size_t len) {
+    std::lock_guard<std::mutex> lock(m_toneCurveMutex);
+    if (!data || len != TONE_CURVE_LEN) {
+        if (m_toneCurve) qDebug2("setToneCurve") << "cleared";
+        m_toneCurve.reset();
+        m_toneCurveProbed = false;
+        return;
+    }
+    m_toneCurve = std::make_shared<const std::vector<uint16_t>>(data, data + len);
+    m_toneCurveProbed = false;
+    qDebug2("setToneCurve") << "installed" << len << "entries";
+}
+
 void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     m_overrideFps = 0.0;
     if (!m_item || !m_window || !m_node) {
@@ -147,7 +176,9 @@ void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     if (url.toString().contains("http://") || url.toString().contains("https://")) {
         m_isHttp = true;
     }
+    const bool isR3dFormat = customDecoder.startsWith("R3D:");
     destroyPlayer();
+    m_isR3dFormat = isR3dFormat;
     initPlayer();
 
     QString additionalUrl;
@@ -174,14 +205,6 @@ void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
         }
     }
     qDebug2("setUrl") << "Final url:" << path;
-
-    // Tag R3D-SDK loads (.r3d/.nev) so that MDKPlayer::play() can run the
-    // deferred self-seek that re-aligns the master clock with the warmed-up
-    // decoder on every Paused→Playing transition (see comment in play()).
-    // Scope is intentionally narrow to the R3D SDK path; other formats
-    // including BRAW are unaffected.
-    m_isR3dFormat = customDecoder.startsWith("R3D:");
-
     m_player->setMedia(qUtf8Printable(path));
     m_player->prepare();
 }
@@ -227,7 +250,11 @@ void MDKPlayer::setReadyForProcessingCallback(ReadyForProcessingCb &&cb) {
 }
 
 void MDKPlayer::setupPlayer() {
-    m_player->setRenderCallback([this](void *) { QMetaObject::invokeMethod(m_item, "update"); });
+    auto player = m_player.get();
+    m_player->setRenderCallback([this, player](void *) {
+        if (m_player.get() != player) return;
+        QMetaObject::invokeMethod(m_item, "update");
+    });
     m_player->setProperty("continue_at_end", "1");
     if (!m_isHttp) {
         m_player->setBufferRange(0);
@@ -235,9 +262,10 @@ void MDKPlayer::setupPlayer() {
     for (auto it = m_defaultProperties.constBegin(); it != m_defaultProperties.constEnd(); ++it) {
         m_player->setProperty(toStdString(it.key()), toStdString(it.value()));
     }
-    m_player->onEvent([this](const mdk::MediaEvent &evt) -> bool {
+    m_player->onEvent([this, player](const mdk::MediaEvent &evt) -> bool {
+        if (m_player.get() != player) return false;
         if (evt.category == "metadata") {
-            auto md = m_player->mediaInfo();
+            auto md = player->mediaInfo();
             QJsonObject obj;
             for (const auto &x : getMediaInfo(md)) {
                 obj.insert(QString::fromUtf8(x.first.c_str(), x.first.size()), QString::fromUtf8(x.second.c_str(), x.second.size()));
@@ -253,10 +281,101 @@ void MDKPlayer::setupPlayer() {
         return true;
     });
 
+    // Tone-curve filter. MDK invokes this before handing the frame to the
+    // renderer, which is the last point where the samples are still wider than
+    // the RGBA8 render target. With no curve installed - i.e. every load that
+    // is not a CinemaDNG carrying a LinearizationTable - it returns immediately
+    // and the frame is delivered byte for byte as before.
+    m_player->onFrame<mdk::VideoFrame>([this, player](mdk::VideoFrame &frame, int) -> int {
+        if (m_player.get() != player) return 0;
+
+        std::shared_ptr<const std::vector<uint16_t>> curve;
+        {
+            std::lock_guard<std::mutex> lock(m_toneCurveMutex);
+            curve = m_toneCurve;
+        }
+        if (!curve) return 0;
+        if (!frame || frame.timestamp() == mdk::TimestampEOS) return 0;
+
+        // The decoded frame is a CFA layout MDK has no PixelFormat name for, so
+        // to() is the only supported way to reach its samples. RGBA64 keeps all
+        // 16 bits through the demosaic, which is the whole point of doing this
+        // here rather than after the renderer.
+        auto wide = frame.to(mdk::PixelFormat::RGBA64);
+        if (!wide) {
+            qDebug2("toneCurve") << "to(RGBA64) failed; frame left untouched";
+            return 0;
+        }
+        const int w = wide.width();
+        const int h = wide.height();
+        const int srcStride = wide.bytesPerLine(0);
+        const uint8_t *src = wide.bufferData(0);
+        const int dstStride = w * 8; // RGBA64 = 4 channels * 2 bytes
+        if (w <= 0 || h <= 0 || !src || srcStride < dstStride) {
+            qDebug2("toneCurve") << "unexpected RGBA64 geometry" << w << h << srcStride;
+            return 0;
+        }
+
+        if (!m_toneCurveProbed.exchange(true)) {
+            // One-shot diagnostic: what the decoder handed over, and whether the
+            // widening really preserved 16 bits. Alpha is skipped - it is a
+            // constant 65535 and would swamp the range. A frame that was only
+            // ever 8-bit has every sample either v*257 or v<<8, so a single
+            // sample that is neither proves the data is genuinely 16-bit.
+            uint16_t mn = 0xFFFF, mx = 0;
+            bool not257 = false, not256 = false;
+            for (int y = 0; y < h; ++y) {
+                const auto *s = reinterpret_cast<const uint16_t *>(src + size_t(y) * size_t(srcStride));
+                for (int x = 0; x < w; ++x, s += 4) {
+                    for (int c = 0; c < 3; ++c) {
+                        // Explicit comparisons: <windows.h> defines min/max as
+                        // macros, which breaks std::min/std::max on MSVC.
+                        if (s[c] < mn) mn = s[c];
+                        if (s[c] > mx) mx = s[c];
+                        if (s[c] % 257 != 0) not257 = true;
+                        if (s[c] % 256 != 0) not256 = true;
+                    }
+                }
+            }
+            qDebug2("toneCurve") << "in fmt" << int(frame.format()) << "planes" << frame.planeCount()
+                                 << "-> RGBA64" << w << "x" << h << "RGB range" << mn << ".." << mx
+                                 << ((not257 && not256) ? "(true 16-bit)" : "(WARNING: 8-bit derived)");
+        }
+
+        std::vector<uint8_t> dst(size_t(dstStride) * size_t(h));
+        const uint16_t *lut = curve->data();
+        for (int y = 0; y < h; ++y) {
+            const auto *s = reinterpret_cast<const uint16_t *>(src + size_t(y) * size_t(srcStride));
+            auto *d = reinterpret_cast<uint16_t *>(dst.data() + size_t(y) * size_t(dstStride));
+            for (int x = 0; x < w; ++x, s += 4, d += 4) {
+                d[0] = lut[s[0]];
+                d[1] = lut[s[1]];
+                d[2] = lut[s[2]];
+                d[3] = s[3]; // alpha carries no scene light
+            }
+        }
+
+        // Allocate and copy in one step: this constructor path allocates a
+        // contiguous buffer and copies `planes` into it, so `dst` may die with
+        // this scope. (addBuffer() on a freshly constructed frame is rejected -
+        // it expects the plane to already exist.)
+        int strides[1] = { dstStride };
+        const uint8_t *planes[1] = { dst.data() };
+        mdk::VideoFrame out(w, h, mdk::PixelFormat::RGBA64, strides, planes);
+        if (!out || !out.bufferData(0)) {
+            qDebug2("toneCurve") << "could not build the curved frame; leaving it untouched";
+            return 0;
+        }
+        out.setTimestamp(frame.timestamp());
+        frame = std::move(out);
+        return 0; // one frame in, one frame out
+    });
+
     m_player->setBackgroundColor(m_bgColor.redF(), m_bgColor.greenF(), m_bgColor.blueF(), m_bgColor.alphaF());
     m_player->setPlaybackRate(m_playbackRate);
 
-    m_player->onStateChanged([this](mdk::State state) {
+    m_player->onStateChanged([this, player](mdk::State state) {
+        if (m_player.get() != player) return;
         // qDebug2("m_player->onStateChanged") <<
         //     QString(state == mdk::State::NotRunning?  "NotRunning"  : "") +
         //     QString(state == mdk::State::Running?     "Running"     : "") +
@@ -265,14 +384,14 @@ void MDKPlayer::setupPlayer() {
         QMetaObject::invokeMethod(m_item, "stateChanged", Q_ARG(int, int(state)));
     });
 
-    m_player->onMediaStatusChanged([this](mdk::MediaStatus status) -> bool {
-        if (!m_player) return false;
+    m_player->onMediaStatusChanged([this, player](mdk::MediaStatus status) -> bool {
+        if (m_player.get() != player) return false;
 
         if (status & mdk::MediaStatus::Buffering) {
             QMetaObject::invokeMethod(m_item, "setBuffering", Q_ARG(bool, true));
         } else if ((status & mdk::MediaStatus::Buffered) && !(status & mdk::MediaStatus::Seeking)) {
             QJsonArray ranges;
-            auto br = m_player->bufferedTimeRanges();
+            auto br = player->bufferedTimeRanges();
             for (const auto &r : br) {
                 QJsonObject obj;
                 obj.insert("start", QJsonValue(double(r.start)));
@@ -294,8 +413,11 @@ void MDKPlayer::setupPlayer() {
         //     QString(status & mdk::MediaStatus::Seeking?   "Seeking | "   : "") +
         //     QString(status & mdk::MediaStatus::Invalid?   "Invalid | "   : "");
 
-        if (!m_videoLoaded && (status & mdk::MediaStatus::Loaded) && (status & mdk::MediaStatus::Prepared)) {
-            auto md = m_player->mediaInfo();
+        bool expectedLoaded = false;
+        if ((status & mdk::MediaStatus::Loaded)
+            && (status & mdk::MediaStatus::Prepared)
+            && m_videoLoaded.compare_exchange_strong(expectedLoaded, true, std::memory_order_acq_rel)) {
+            auto md = player->mediaInfo();
 
             /*QJsonObject obj;
             for (const auto &x : getMediaInfo(md)) {
@@ -327,8 +449,7 @@ void MDKPlayer::setupPlayer() {
                 QMetaObject::invokeMethod(m_item, "update");
                 m_firstFrameLoaded = true;
             }
-            m_player->setLoop(9999999);
-            m_videoLoaded = true;
+            player->setLoop(9999999);
 
             if (!m_connectionBeforeRendering)
                 m_connectionBeforeRendering = QObject::connect(m_window, &QQuickWindow::beforeRendering, [this] { this->windowBeforeRendering(); });
@@ -378,7 +499,7 @@ void MDKPlayer::windowBeforeRendering() {
     // Don't render if sync() hasn't set up the render API for the current player yet
     if (m_syncNext) return;
 
-    if (player->state() != mdk::PlaybackState::Playing && m_renderedPosition == m_playerPosition && m_renderedReturnCount++ > 100) {
+    if (!m_playbackRequested.load(std::memory_order_acquire) && m_renderedPosition == m_playerPosition && m_renderedReturnCount++ > 100) {
         return;
     }
     if (m_readyForProcessing && !m_readyForProcessing(m_item)) return;
@@ -394,7 +515,18 @@ void MDKPlayer::windowBeforeRendering() {
 
     if (doRenderPass) {
         QRhiResourceUpdateBatch *u = context->rhi()->nextResourceUpdateBatch();
-        cb->beginPass(m_rt.get(), QColor(Qt::black), { 1.0f, 0 }, u, QRhiCommandBuffer::ExternalContent);
+        QRhiTextureRenderTarget *rt = m_rt.get();
+#if (__ANDROID__+0)
+        // m_rt preserves its color contents on Android, so the very first pass
+        // after the texture was (re)created goes through the clearing target to
+        // initialise the allocation. Both target the same texture, so which one
+        // opens the pass only decides whether the contents survive.
+        if (m_needsInitialClear && m_rtClear) {
+            rt = m_rtClear.get();
+            m_needsInitialClear = false;
+        }
+#endif
+        cb->beginPass(rt, QColor(Qt::black), { 1.0f, 0 }, u, QRhiCommandBuffer::ExternalContent);
     }
 
     cb->beginExternal();
@@ -482,7 +614,9 @@ void MDKPlayer::windowBeforeRendering() {
                     m_fence->SetEventOnCompletion(m_fenceValue, m_event);
                     WaitForSingleObject(m_event, 5000);
                 }
+                ctx4->Release();
             }
+            dev5->Release();
         }
     }
 #endif
@@ -556,37 +690,23 @@ void MDKPlayer::sync(QSGImageNode *node, QSize newSize, QQuickItem *item, bool f
 
 void MDKPlayer::play() {
     if (!m_videoLoaded || !m_player) return;
+    const int64_t pos = m_playerPosition;
+    m_playbackRequested.store(true, std::memory_order_release);
     m_player->set(mdk::PlaybackState::Playing);
     forceRedraw();
-
-    if (m_isR3dFormat && m_item) {
-        // R3D SDK preview: Play immediately so the user gets visual feedback,
-        // then 500 ms later auto-issue seek(displayedPos) to mimic the manual
-        // user recovery sequence "Play → click timeline → fluid playback".
-        // The 500 ms Play interval warms up the cold R3D decoder, and the
-        // delayed seek flushes the packet queue + re-aligns the master clock
-        // with the warmed-up decoder. Without this, every Paused→Playing
-        // transition desyncs again because the decoder went cold during Pause.
-        // Scoped to R3D SDK only; other formats are unaffected.
-        QTimer::singleShot(500, m_item, [this] {
-            if (m_shuttingDown.load() || !m_player) return;
-            // Seek to the *displayed* frame timestamp, not m_player->position()
-            // — the latter returns the stalled master clock during buffering,
-            // which is older than the frame currently rendered, so seeking to
-            // it makes the picture jump backwards by one frame.
-            const int64_t pos = m_playerPosition;
-            qDebug2("MDKPlayer") << "R3D play: deferred self-seek to displayedPos=" << pos;
-            m_player->seek(pos, mdk::SeekFlag::FromStart);
-        });
+    if (m_isR3dFormat) {
+        m_player->seek(pos, mdk::SeekFlag::FromStart);
     }
 }
 void MDKPlayer::pause() {
     if (!m_videoLoaded || !m_player) return;
+    m_playbackRequested.store(false, std::memory_order_release);
     m_player->set(mdk::PlaybackState::Paused);
     forceRedraw();
 }
 void MDKPlayer::stop() {
     if (!m_videoLoaded || !m_player) return;
+    m_playbackRequested.store(false, std::memory_order_release);
     m_player->set(mdk::PlaybackState::Stopped);
     m_player->waitFor(mdk::PlaybackState::Stopped);
 }
