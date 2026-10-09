@@ -36,6 +36,7 @@ public:
     void setProperty(const QString &key, const QString &value);
     void setDefaultProperty(const QString &key, const QString &value);
     QString defaultVideoDecoders() const;
+    void setSourceAspectRatio(bool enabled);
 
     // Tone curve applied to decoded frames before they reach the renderer.
     //
@@ -114,6 +115,8 @@ public:
     void setUserData2Destructor(std::function<void(void *)> &&cb);
 
 private:
+    void applySourceAspectRatio();
+    std::atomic<bool> m_sourceAspectRatio{false};
     std::vector<std::string> defaultDecoderList() const;
     // True while the preview uses the built-in Windows decoder list, which may be
     // narrowed to software decoding once the stream format is known.

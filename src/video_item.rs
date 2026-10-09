@@ -55,6 +55,7 @@ pub struct MDKVideoItem {
     pub setProperty: qt_method!(fn(&mut self, key: QString, value: QString)),
     pub setDefaultProperty: qt_method!(fn(&mut self, key: QString, value: QString)),
     pub defaultVideoDecoders: qt_method!(fn(&self) -> QString),
+    pub setSourceAspectRatio: qt_method!(fn(&mut self, enabled: bool)),
 
     pub forceRedraw: qt_method!(fn(&mut self)),
 
@@ -168,6 +169,10 @@ impl MDKVideoItem {
 
     pub fn defaultVideoDecoders(&self) -> QString {
         self.m_player.default_video_decoders()
+    }
+
+    pub fn setSourceAspectRatio(&mut self, enabled: bool) {
+        self.m_player.set_source_aspect_ratio(enabled);
     }
 
     /// Installs a tone curve applied to decoded frames before they reach the

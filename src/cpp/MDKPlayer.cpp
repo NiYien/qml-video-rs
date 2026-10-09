@@ -171,6 +171,24 @@ void MDKPlayer::setDefaultProperty(const QString &key, const QString &value) {
     m_defaultProperties.insert(key, value);
 }
 
+void MDKPlayer::setSourceAspectRatio(bool enabled) {
+    m_sourceAspectRatio = enabled;
+    applySourceAspectRatio();
+    forceRedraw();
+    if (m_item) m_item->update();
+}
+
+void MDKPlayer::applySourceAspectRatio() {
+    if (!m_player) return;
+    if (!m_sourceAspectRatio) {
+        m_player->setAspectRatio(mdk::KeepAspectRatio);
+        return;
+    }
+    // The processing surface already follows the source pixel dimensions.
+    // Fill it without applying display SAR or introducing letterbox padding.
+    m_player->setAspectRatio(mdk::IgnoreAspectRatio);
+}
+
 void MDKPlayer::setToneCurve(const uint16_t *data, size_t len) {
     std::lock_guard<std::mutex> lock(m_toneCurveMutex);
     if (!data || len != TONE_CURVE_LEN) {
@@ -477,6 +495,7 @@ void MDKPlayer::setupPlayer() {
                     v.frames = (double(v.duration) / 1000.0) * v.codec.frame_rate;
                 }
                 m_fps = v.codec.frame_rate;
+                if (m_sourceAspectRatio) applySourceAspectRatio();
                 double fps = m_fps;
                 m_duration = v.duration;
                 if (m_overrideFps > 0.0) {
@@ -732,6 +751,7 @@ void MDKPlayer::sync(QSGImageNode *node, QSize newSize, QQuickItem *item, bool f
     node->setFiltering(QSGTexture::Linear);
     node->setRect(0, 0, m_item->width(), m_item->height());
     m_player->setVideoSurfaceSize(m_size.width(), m_size.height());
+    if (m_sourceAspectRatio) applySourceAspectRatio();
 }
 
 void MDKPlayer::play() {

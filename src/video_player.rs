@@ -64,6 +64,12 @@ impl MDKPlayerWrapper {
         })
     }
 
+    pub fn set_source_aspect_ratio(&mut self, enabled: bool) {
+        cpp!(unsafe [self as "MDKPlayerWrapper *", enabled as "bool"] {
+            self->mdkplayer->setSourceAspectRatio(enabled);
+        })
+    }
+
     /// Installs a 65536-entry tone curve applied to decoded frames before they
     /// reach the renderer. Any other length clears it. See `MDKPlayer::setToneCurve`.
     pub fn set_tone_curve(&mut self, curve: &[u16]) {
