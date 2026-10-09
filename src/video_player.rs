@@ -58,6 +58,11 @@ impl MDKPlayerWrapper {
             self->mdkplayer->setDefaultProperty(key, value);
         })
     }
+    pub fn default_video_decoders(&self) -> QString {
+        cpp!(unsafe [self as "MDKPlayerWrapper *"] -> QString as "QString" {
+            return self->mdkplayer->defaultVideoDecoders();
+        })
+    }
 
     /// Installs a 65536-entry tone curve applied to decoded frames before they
     /// reach the renderer. Any other length clears it. See `MDKPlayer::setToneCurve`.

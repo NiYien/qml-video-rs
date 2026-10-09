@@ -35,6 +35,7 @@ public:
     void setUrl(const QUrl &url, const QString &customDecoder);
     void setProperty(const QString &key, const QString &value);
     void setDefaultProperty(const QString &key, const QString &value);
+    QString defaultVideoDecoders() const;
 
     // Tone curve applied to decoded frames before they reach the renderer.
     //
@@ -113,6 +114,11 @@ public:
     void setUserData2Destructor(std::function<void(void *)> &&cb);
 
 private:
+    std::vector<std::string> defaultDecoderList() const;
+    // True while the preview uses the built-in Windows decoder list, which may be
+    // narrowed to software decoding once the stream format is known.
+    std::atomic<bool> m_autoSoftwareDecoders{false};
+
     QMetaObject::Connection m_connectionBeforeRendering;
     QMetaObject::Connection m_connectionScreenChanged;
 

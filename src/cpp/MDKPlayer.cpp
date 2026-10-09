@@ -3,6 +3,7 @@
 #include <string>
 #include <thread>
 #include <QTimer>
+#include <QStringList>
 #include <QJsonArray>
 #include <QGuiApplication>
 #if __has_include(<QX11Info>)
@@ -34,11 +35,7 @@ MDKPlayer::MDKPlayer() {
 #endif
 }
 
-void MDKPlayer::initPlayer() {
-    m_player = std::make_unique<mdk::Player>();
-    m_metadata = QJsonObject();
-    m_shuttingDown = false;
-
+std::vector<std::string> MDKPlayer::defaultDecoderList() const {
     QString overrideDecoders = QString(qgetenv("MDK_DECODERS")).trimmed();
 
     if (!overrideDecoders.isEmpty()) {
@@ -46,9 +43,9 @@ void MDKPlayer::initPlayer() {
         for (const auto &x : overrideDecoders.split(",")) {
             vec.push_back(toStdString(x));
         }
-        m_player->setDecoders(mdk::MediaType::Video, vec);
+        return vec;
     } else {
-        m_player->setDecoders(mdk::MediaType::Video, {
+        return {
     #if (__APPLE__+0)
         "VT:duration=0",
     #elif (__ANDROID__+0)
@@ -65,9 +62,10 @@ void MDKPlayer::initPlayer() {
         //"CUDA",
         //"NVDEC",
         //"CUVID",
-        // Limit hardware frame buffers; let FFmpeg retain automatic threading for software fallback.
-        "D3D11:threads=1:sw_fallback=0",
-        "DXVA",
+        // Slice threading avoids the extra hardware surfaces that frame threading allocates.
+        // Formats D3D11/DXVA cannot decode are switched to "FFmpeg" in setUrl before the decoder opens.
+        "D3D11:threads=0:thread_type=slice:sw_fallback=1",
+        "DXVA:threads=0:thread_type=slice:sw_fallback=1",
     #elif (__linux__+0)
         "CUDA",
         "VDPAU",
@@ -87,8 +85,25 @@ void MDKPlayer::initPlayer() {
     #else
         "R3D:gpu=auto:scale=1920x1080",
     #endif
-        "FFmpeg"});
+        "FFmpeg"};
     }
+}
+
+QString MDKPlayer::defaultVideoDecoders() const {
+    QStringList names;
+    for (const auto &name : defaultDecoderList()) names.append(QString::fromStdString(name));
+    return names.join(',');
+}
+
+void MDKPlayer::initPlayer() {
+    m_player = std::make_unique<mdk::Player>();
+    m_metadata = QJsonObject();
+    m_shuttingDown = false;
+
+    m_player->setDecoders(mdk::MediaType::Video, defaultDecoderList());
+#if (_WIN32+0)
+    m_autoSoftwareDecoders = QString(qgetenv("MDK_DECODERS")).trimmed().isEmpty();
+#endif
 
     if (m_item && m_node && m_window) {
         setupPlayer();
@@ -141,15 +156,18 @@ MDKPlayer::~MDKPlayer() {
 }
 
 void MDKPlayer::setProperty(const QString &key, const QString &value) {
+#if (_WIN32+0)
+    if (key == "video.decoders") {
+        m_autoSoftwareDecoders = QString(qgetenv("MDK_DECODERS")).trimmed().isEmpty() && value == defaultVideoDecoders();
+    }
+#endif
     if (m_player) {
         m_player->setProperty(toStdString(key), toStdString(value));
     }
 }
 
 void MDKPlayer::setDefaultProperty(const QString &key, const QString &value) {
-    if (m_player) {
-        m_player->setProperty(toStdString(key), toStdString(value));
-    }
+    setProperty(key, value);
     m_defaultProperties.insert(key, value);
 }
 
@@ -165,6 +183,20 @@ void MDKPlayer::setToneCurve(const uint16_t *data, size_t len) {
     m_toneCurveProbed = false;
     qDebug2("setToneCurve") << "installed" << len << "entries";
 }
+
+#if (_WIN32+0)
+// FFmpeg offers D3D11/DXVA output only for these formats. Anything else falls back to software
+// inside the hardware decoder, which keeps its slice-only threading; single-slice streams then
+// decode on one core.
+static bool hardwareDecoderSupports(const mdk::VideoCodecParameters &codec) {
+    const std::string name = codec.codec ? codec.codec : "";
+    const std::string format = codec.format_name ? codec.format_name : "";
+    if (format.empty()) return true;
+    if (name == "h264") return format == "yuv420p" || format == "yuvj420p";
+    if (name == "hevc") return format == "yuv420p" || format == "yuvj420p" || format == "yuv420p10le";
+    return true;
+}
+#endif
 
 void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     m_overrideFps = 0.0;
@@ -206,7 +238,21 @@ void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     }
     qDebug2("setUrl") << "Final url:" << path;
     m_player->setMedia(qUtf8Printable(path));
+#if (_WIN32+0)
+    auto player = m_player.get();
+    // Called once the stream info is known and before the video decoder is created.
+    m_player->prepare(0, [this, player](int64_t position, bool *) {
+        if (position < 0 || !m_autoSoftwareDecoders.load()) return true;
+        const auto &info = player->mediaInfo();
+        if (!info.video.empty() && !hardwareDecoderSupports(info.video[0].codec)) {
+            player->setDecoders(mdk::MediaType::Video, {"FFmpeg"});
+            qDebug2("setUrl") << "Software decoder selected for" << info.video[0].codec.codec << info.video[0].codec.format_name;
+        }
+        return true;
+    });
+#else
     m_player->prepare();
+#endif
 }
 
 void MDKPlayer::setBackgroundColor(const QColor &color) {
@@ -260,7 +306,7 @@ void MDKPlayer::setupPlayer() {
         m_player->setBufferRange(0);
     }
     for (auto it = m_defaultProperties.constBegin(); it != m_defaultProperties.constEnd(); ++it) {
-        m_player->setProperty(toStdString(it.key()), toStdString(it.value()));
+        setProperty(it.key(), it.value());
     }
     m_player->onEvent([this, player](const mdk::MediaEvent &evt) -> bool {
         if (m_player.get() != player) return false;

@@ -54,6 +54,7 @@ pub struct MDKVideoItem {
     pub setUrl: qt_method!(fn(&mut self, url: QUrl, custom_decoder: QString)),
     pub setProperty: qt_method!(fn(&mut self, key: QString, value: QString)),
     pub setDefaultProperty: qt_method!(fn(&mut self, key: QString, value: QString)),
+    pub defaultVideoDecoders: qt_method!(fn(&self) -> QString),
 
     pub forceRedraw: qt_method!(fn(&mut self)),
 
@@ -163,6 +164,10 @@ impl MDKVideoItem {
     /// This property is applied to MDKPlayer after each time it's (re)created and before loading any media.
     pub fn setDefaultProperty(&mut self, key: QString, value: QString) {
         self.m_player.set_default_property(key, value);
+    }
+
+    pub fn defaultVideoDecoders(&self) -> QString {
+        self.m_player.default_video_decoders()
     }
 
     /// Installs a tone curve applied to decoded frames before they reach the
