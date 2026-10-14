@@ -20,6 +20,7 @@
 typedef std::function<bool(QQuickItem *item, uint32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t backend_id, uint64_t ptr1, uint64_t ptr2, uint64_t ptr3, uint64_t ptr4, uint64_t ptr5)> ProcessTextureCb;
 typedef std::function<QImage(QQuickItem *item, uint32_t frame, double timestamp, const QImage &img)> ProcessPixelsCb;
 typedef std::function<bool(QQuickItem *item)> ReadyForProcessingCb;
+// Negative frame numbers are terminal: -1 means finished, -2 means prepare failed.
 typedef std::function<bool(int32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t org_width, uint32_t org_height, double fps, double duration_ms, uint32_t frame_count, const uint8_t *bits, uint64_t bitsSize)> VideoProcessCb;
 
 namespace mdk { class Player; }

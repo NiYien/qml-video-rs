@@ -862,13 +862,17 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
     }
 
     auto range_id = std::make_shared<uint>(0);
-    auto finished = std::make_shared<bool>(false);
+    auto finished = std::make_shared<std::atomic_bool>(false);
+    auto finish = [cb, finished](int result) {
+        if (!finished->exchange(true)) {
+            cb(result, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+    };
 
-    player->onFrame<mdk::VideoFrame>([cb, width, height, id, range_id = std::move(range_id), finished = std::move(finished), yuv, ranges, this](mdk::VideoFrame &v, int) -> int {
+    player->onFrame<mdk::VideoFrame>([cb, finish, width, height, id, range_id = std::move(range_id), finished, yuv, ranges, this](mdk::VideoFrame &v, int) -> int {
         if (*finished) return 0;
         if (!v || v.timestamp() == mdk::TimestampEOS) { // AOT frame(1st frame, seek end 1st frame) is not valid, but format is valid. eof frame format is invalid
-            cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            *finished = true;
+            finish(-1);
             return 0;
         }
         if (!v.format()) {
@@ -927,8 +931,7 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
                 // If cb returns false - stop the processing
                 m_processingPlayers[id]->set(mdk::PlaybackState::Paused);
                 m_processingPlayers[id]->waitFor(mdk::PlaybackState::Paused);
-                cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                *finished = true;
+                finish(-1);
                 return 0;
             }
         }
@@ -941,8 +944,7 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
             }
             m_processingPlayers[id]->set(mdk::PlaybackState::Paused);
             m_processingPlayers[id]->waitFor(mdk::PlaybackState::Paused);
-            cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            *finished = true;
+            finish(-1);
             return 0;
         }
 
@@ -950,7 +952,14 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
     });
     player->setVideoSurfaceSize(64, 64);
 
-    player->prepare(ranges[0].first);
+    player->prepare(ranges[0].first, [finish](int64_t position, bool *) {
+        if (position >= 0) return true;
+        // Opening can fail without delivering any frame, including an EOS frame.
+        // Wake the processing caller so it can stop and release this player.
+        qWarning() << "MDK processing prepare failed:" << position;
+        finish(-2);
+        return false;
+    });
     player->set(State::Running);
 }
 
